@@ -698,7 +698,7 @@ class M3DCLIP_stage2(PreTrainedModel):
         if config.use_2D_Encoder:
             # 如果预提取特征与 Student 维度完全一致且不需要微调，可以用 Identity
             # 但通常加一个 Linear 层能更好地将 2D 语义映射到 3D 上下文
-            self.teacher_adapter = nn.Linear(768, config.hidden_size)
+            self.teacher_adapter = nn.Linear(512, config.hidden_size)
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.local_loss = config.local_loss
