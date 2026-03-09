@@ -694,11 +694,11 @@ class M3DCLIP_stage2(PreTrainedModel):
 
         # 5. Teacher Adapter (用于适配预提取的 768 维 2D 特征)
         # 我们不再加载庞大的 BiomedCLIP 模型，而是直接使用一个线性层来微调特征
-        self.teacher_adapter = nn.Identity() 
-        if config.use_2D_Encoder:
-            # 如果预提取特征与 Student 维度完全一致且不需要微调，可以用 Identity
-            # 但通常加一个 Linear 层能更好地将 2D 语义映射到 3D 上下文
-            self.teacher_adapter = nn.Linear(512, config.hidden_size)
+        # self.teacher_adapter = nn.Identity() 
+        # if config.use_2D_Encoder:
+        #     # 如果预提取特征与 Student 维度完全一致且不需要微调，可以用 Identity
+        #     # 但通常加一个 Linear 层能更好地将 2D 语义映射到 3D 上下文
+        #     self.teacher_adapter = nn.Linear(512, config.hidden_size)
 
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
         self.local_loss = config.local_loss
@@ -811,7 +811,7 @@ class M3DCLIP_stage2(PreTrainedModel):
         # --- 2. 运行 HSENet (Student) ---
         # 这里我们将 SGA 用的特征传入 Vision Encoder，用于 Cross-Attention
         # ViT 返回字典: {'cls_feats', 'f_3d_raw', 'patch_feats', ...}
-        vision_out = self.vision_encoder(images, slice_features=feat_sga)
+        vision_out = self.vision_encoder(images, slice_features=image_2d_sga)
 
         cls_feats = vision_out["cls_feats"]
         f_3d_raw = vision_out["f_3d_raw"]   # [B, N, 768] (SGAT 纯 3D 输出)
@@ -830,11 +830,11 @@ class M3DCLIP_stage2(PreTrainedModel):
         # 我们使用 dataset 提供的 image_2d_kd (feat_kd) 和 纯 3D 特征 (f_3d_raw)
         # 需要先将 f_3d_raw 通过 ViT 内部的 KD Projector 投影
         loss_KD = torch.tensor(0.0, device=images.device)
-        if feat_kd is not None:
+        if image_2d_kd is not None:
             # 调用 ViT 内部的投影层 (Student Projection)
             student_kd_proj = self.vision_encoder.kd_proj(f_3d_raw)
             # 计算 Loss: Student Proj vs Teacher KD Slices
-            loss_KD = self.loss_B1(student_kd_proj, feat_kd, self.vision_encoder.sgat.grid_shape)
+            loss_KD = self.loss_B1(student_kd_proj, image_2d_kd, self.vision_encoder.sgat.grid_shape)
 
         # (C) Topology Loss (结构平滑)
         neighbor_idx = self.vision_encoder.sgat.neighbor_idx
