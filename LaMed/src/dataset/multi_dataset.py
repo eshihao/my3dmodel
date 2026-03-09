@@ -1983,8 +1983,8 @@ class Stage2CapDataset(Dataset):
         # 容错：文件不存在时返回零向量
         if not os.path.exists(feat_path):
             # print(f"Warning: {feat_path} not found.")
-            feats_kd = torch.zeros((self.num_slices_kd, 768), dtype=torch.float32)
-            feats_sga = torch.zeros((self.num_slices_sga, 768), dtype=torch.float32)
+            feats_kd = torch.zeros((self.num_slices_kd, 512), dtype=torch.float32)
+            feats_sga = torch.zeros((self.num_slices_sga, 512), dtype=torch.float32)
             return feats_kd, feats_sga
 
         try:
@@ -2011,8 +2011,8 @@ class Stage2CapDataset(Dataset):
 
         except Exception as e:
             print(f"Error loading 2D npy {feat_path}: {e}")
-            feats_kd = torch.zeros((self.num_slices_kd, 768), dtype=torch.float32)
-            feats_sga = torch.zeros((self.num_slices_sga, 768), dtype=torch.float32)
+            feats_kd = torch.zeros((self.num_slices_kd, 512), dtype=torch.float32)
+            feats_sga = torch.zeros((self.num_slices_sga, 512), dtype=torch.float32)
             return feats_kd, feats_sga
 
     def __getitem__(self, idx):
