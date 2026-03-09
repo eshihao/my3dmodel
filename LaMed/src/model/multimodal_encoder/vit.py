@@ -756,9 +756,10 @@ class ThreeDSGAT(nn.Module):
         attn_scores = torch.einsum("bnhd,bnkhd->bnhk", q, k) / math.sqrt(self.head_dim)
         
         # Distance Weighting (距离越近权重越大)
-        spatial_weight = torch.exp(- (self.distance_gamma * self.neighbor_dist.unsqueeze(0).unsqueeze(2))) # [1, N, 1, K]
-        attn_scores = attn_scores * spatial_weight.to(attn_scores.device)
-        
+        # spatial_weight = torch.exp(- (self.distance_gamma * self.neighbor_dist.unsqueeze(0).unsqueeze(2))) # [1, N, 1, K]
+        # attn_scores = attn_scores * spatial_weight.to(attn_scores.device)
+        distance_penalty = self.distance_gamma * self.neighbor_dist.unsqueeze(0).unsqueeze(2)
+        attn_scores = attn_scores - distance_penalty.to(attn_scores.device)
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         
@@ -784,6 +785,7 @@ class ViT_stage2(nn.Module):
         num_layers: int = 12,
         num_heads: int = 12,
         dropout_rate: float = 0.0,
+        pos_embed: str = "perceptron",
         spatial_dims: int = 3,
         **kwargs
     ) -> None:
@@ -799,6 +801,7 @@ class ViT_stage2(nn.Module):
             img_size=self.img_size,
             patch_size=self.patch_size,
             hidden_size=hidden_size,
+            pos_emded=pos_embed,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             spatial_dims=spatial_dims,
@@ -847,13 +850,16 @@ class ViT_stage2(nn.Module):
         # 所以 id = h * (W*D) + w * D + d
         # d = id % D
         patch_indices = torch.arange(num_patches, device=device)
-        d_indices = patch_indices % D # [N]
+        # d_indices = patch_indices % D # [N]
         
-        # 将深度 d (0 ~ D-1) 映射到 slice 索引 (0 ~ S-1)
-        # 使用线性映射
-        slice_indices = (d_indices.float() / (D - 1) * (S - 1)).round().long()
-        slice_indices = slice_indices.clamp(0, S - 1)
-        
+        # # 将深度 d (0 ~ D-1) 映射到 slice 索引 (0 ~ S-1)
+        # # 使用线性映射
+        # slice_indices = (d_indices.float() / (D - 1) * (S - 1)).round().long()
+        # slice_indices = slice_indices.clamp(0, S - 1)
+
+        h_indices = patch_indices // (W * D) 
+        slice_indices = (h_indices.float() / (H - 1) * (S - 1)).round().long().clamp(0, S-1)
+                
         # Gather: 对每个 Batch，根据索引取出对应的 Slice 特征
         # [B, S, C] -> [B, N, C]
         expanded_feats = []
@@ -915,7 +921,7 @@ class ViT_stage2(nn.Module):
 
         return {
             "cls_feats": x_out[:, 0],       # [B, C] -> 用于 Image-Text CL Loss
-            "patch_feats": f_fused,         # [B, N, C] -> 融合后的特征 (可选用于后续任务)
+            "patch_feats": x_out,         # [B, N, C] -> 融合后的特征 (可选用于后续任务)
             "kd_data": kd_dict,             # 包含 student 和 teacher 特征 -> 用于 KD Loss
             "att_map": att_map,             # 可视化 Attention Map
             "f_3d_raw": f_3d_raw            # SGAT 原始输出 -> 用于 Topology Loss
