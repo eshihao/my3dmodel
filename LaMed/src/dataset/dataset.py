@@ -1173,9 +1173,20 @@ import monai.transforms as mtf
 from torch.utils.data import Dataset, ConcatDataset
 from monai.data import set_track_meta
 
-# 兜底 2D 特征
-def load_or_create_2d_feat(image_path):
-    return torch.zeros((4, 768), dtype=torch.bfloat16)
+def load_or_create_2d_feat(image_abs_path):
+    # 既然在同一目录下，直接替换文件后缀即可
+    # 匹配你提取脚本里写的 "_2D.npy" (请根据实际情况确认大小写)
+    feat_2d_path = image_abs_path.replace(".npy", "_2D.npy")
+    
+    if os.path.exists(feat_2d_path):
+        feat_2d = np.load(feat_2d_path)
+        # 必须转成张量传给模型
+        return torch.tensor(feat_2d, dtype=torch.bfloat16)
+    else:
+        # 如果真的极个别文件丢失，再迫不得已用 zeros 兜底
+        print(f"\n[警告] 找不到对应的 2D 特征文件，使用零矩阵兜底: {feat_2d_path}")
+        # 建议把兜底的 Z 轴层数改为 32，对齐 3D 图像的深度，特征维度为 512
+        return torch.zeros((32, 512), dtype=torch.bfloat16)
 
 Caption_templates = ["Describe this medical image.", "What does this image show?", "Provide a caption for this scan."]
 
