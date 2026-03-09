@@ -1104,7 +1104,7 @@ class DataCollator:
                 'input_id': torch.full((L,), self.pad_token_id, dtype=torch.long),
                 'label': torch.full((L,), -100, dtype=torch.long),
                 'attention_mask': torch.ones((L,), dtype=torch.long),
-                'image_2d': torch.zeros((4, 768), dtype=torch.float)
+                'image_2d': torch.zeros((32, 512), dtype=torch.float)
             }
             dummy['label'][0] = 0
             valid_batch = [dummy]
