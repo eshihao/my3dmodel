@@ -1176,10 +1176,17 @@ def main():
     if model_args.pretrain_mm_mlp_adapter and os.path.exists(model_args.pretrain_mm_mlp_adapter):
         rank0_print(f"🔗 正在物理加载 3.1 阶段预训练 Projector: {model_args.pretrain_mm_mlp_adapter}")
         projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location="cpu")
-        projector_dict = {k: v for k, v in projector_weights.items() if "mm_projector" in k}
-        if len(projector_dict) > 0:
-            model.get_model().load_state_dict(projector_dict, strict=False)
-            rank0_print(f"✅ 成功加载 {len(projector_dict)} 个 Projector 参数！模型成功睁开双眼！")
+        
+        # [核心修复]：动态清理多余的嵌套前缀！
+        cleaned_projector_dict = {}
+        for k, v in projector_weights.items():
+            if "mm_projector" in k:
+                new_k = k[k.find("mm_projector"):] # 只保留 mm_projector 及以后的名字
+                cleaned_projector_dict[new_k] = v
+                
+        if len(cleaned_projector_dict) > 0:
+            model.get_model().load_state_dict(cleaned_projector_dict, strict=False)
+            rank0_print(f"✅ 成功加载 {len(cleaned_projector_dict)} 个 Projector 参数！模型成功睁开双眼！")
         else:
             rank0_print("❌ [致命错误] 找到了文件，但里面没有 mm_projector 参数！")
 
