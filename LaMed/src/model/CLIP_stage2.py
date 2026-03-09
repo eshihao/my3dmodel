@@ -750,17 +750,16 @@ class M3DCLIP_stage2(PreTrainedModel):
         """
         B, N, C = student_3d_feats.shape
         S = teacher_2d_feats.shape[1]
-        _, _, D = grid_shape
+        H, W, D = grid_shape
         
         # 这里的逻辑是：将 2D Slice 特征扩展到 3D 空间，作为 Target
         # 1. 计算每个 Patch 对应的 Slice Index
         patch_idx = torch.arange(N, device=student_3d_feats.device)
         # 假设 N 排列为 H->W->D, 则深度索引 d = patch_idx % D
-        d_indices = patch_idx % D
-        
-        # 2. 映射 D -> S
-        slice_indices = (d_indices.float() / (D - 1) * (S - 1)).round().long().clamp(0, S-1)
-        
+
+        h_indices = patch_idx // (W * D) 
+        slice_indices = (h_indices.float() / (H - 1) * (S - 1)).round().long().clamp(0, S-1)
+                
         # 3. 扩展 Teacher 特征 [B, S, C] -> [B, N, C]
         teacher_expanded = []
         for b in range(B):
@@ -768,7 +767,9 @@ class M3DCLIP_stage2(PreTrainedModel):
         teacher_target = torch.stack(teacher_expanded, dim=0)
         
         # 4. 计算 MSE
-        return F.mse_loss(student_3d_feats, teacher_target)
+        student_norm = F.normalize(student_3d_feats, dim=-1)
+        teacher_norm = F.normalize(teacher_target, dim=-1)
+        return F.mse_loss(student_norm, teacher_norm)
 
     def image_text_contrastive_learning(self, image_features, text_features, labels):
         if self.gather_loss:
