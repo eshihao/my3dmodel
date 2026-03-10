@@ -801,12 +801,12 @@ class M3DCLIP_stage2(PreTrainedModel):
         
         # --- 1. 适配 2D 特征 (Teacher Adapter) ---
         # 即使输入已经是 768 维，加上一个 Linear 层能更好地适应
-        feat_kd = None
-        feat_sga = None
-        if image_2d_kd is not None:
-            feat_kd = self.teacher_adapter(image_2d_kd) # [B, S_kd, 768]
-        if image_2d_sga is not None:
-            feat_sga = self.teacher_adapter(image_2d_sga) # [B, S_sga, 768]
+        # feat_kd = None
+        # feat_sga = None
+        # if image_2d_kd is not None:
+        #     feat_kd = self.teacher_adapter(image_2d_kd) # [B, S_kd, 768]
+        # if image_2d_sga is not None:
+        #     feat_sga = self.teacher_adapter(image_2d_sga) # [B, S_sga, 768]
 
         # --- 2. 运行 HSENet (Student) ---
         # 这里我们将 SGA 用的特征传入 Vision Encoder，用于 Cross-Attention
