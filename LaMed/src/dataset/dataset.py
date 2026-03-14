@@ -1368,6 +1368,7 @@ class UniDatasets(Dataset):
         super(UniDatasets, self).__init__()
         self.ds_list = [
             CapDataset(args, tokenizer, mode),
+            # stage3_1注释掉VQA数据集
             VQADataset(args, tokenizer, close_ended=True, mode=mode),
             VQADataset(args, tokenizer, close_ended=False, mode=mode),
         ]
