@@ -1167,28 +1167,65 @@ def main():
     model_args.num_new_tokens = 4
     model.initialize_vision_tokenizer(model_args, tokenizer)
 
+    # ================= [终极绝杀：视觉参数精准提取机] =================
+# ================= [终极修复：视觉双塔权重精准映射] =================
     if model_args.pretrained_vision_tower_path and os.path.exists(model_args.pretrained_vision_tower_path):
-        rank0_print(f"Loading Stage 2 weights: {model_args.pretrained_vision_tower_path}")
-        stage2_dict = load_file(model_args.pretrained_vision_tower_path) if model_args.pretrained_vision_tower_path.endswith(".safetensors") else torch.load(model_args.pretrained_vision_tower_path, map_location="cpu")
-        vision_dict = {k.replace("vision_encoder.", ""): v for k, v in stage2_dict.items() if "vision_encoder." in k}
-        model.get_model().vision_tower.load_state_dict(vision_dict, strict=False)
+        rank0_print(f"🚀 正在执行手术级权重映射: {model_args.pretrained_vision_tower_path}")
+        
+        # 支持 safetensors 和 torch 格式
+        if model_args.pretrained_vision_tower_path.endswith(".safetensors"):
+            stage2_dict = load_file(model_args.pretrained_vision_tower_path)
+        else:
+            stage2_dict = torch.load(model_args.pretrained_vision_tower_path, map_location="cpu")
+        
+        vision_dict = {}
+        for k, v in stage2_dict.items():
+            # 1. 映射 Stage 1 视觉塔 (从 CLIP 的 vision_encoder 提取)
+            if k.startswith("stage1_pretrained_CLIP.vision_encoder."):
+                new_k = k.replace("stage1_pretrained_CLIP.vision_encoder.", "vision_tower_stage1.")
+                vision_dict[new_k] = v
+            
+            # 2. 映射 Stage 2 视觉塔 (处理 vision_encoder 前缀)
+            elif k.startswith("vision_encoder."):
+                new_k = k.replace("vision_encoder.", "vision_tower_stage2.")
+                vision_dict[new_k] = v
+                
+            # 3. 映射 Stage 2 视觉塔 (处理处于顶层的 blocks, sgat 等参数)
+            elif any(k.startswith(p) for p in ["blocks.", "patch_embedding.", "cls_token", "norm.", "sgat.", "sga.", "sga_adapter", "kd_proj"]):
+                new_k = f"vision_tower_stage2.{k}"
+                vision_dict[new_k] = v
+        
+        # 使用 strict=False 加载，因为我们要自动过滤掉权重里自带的 language_encoder (BERT)
+        res = model.get_model().vision_tower.load_state_dict(vision_dict, strict=False)
+        
+        # 关键验证：确保视觉块没有丢失
+        missing_vision = [m for m in res.missing_keys if "vision_tower_stage2.blocks.0" in m]
+        if missing_vision:
+            rank0_print(f"❌ [致命警告] 视觉核心组件加载失败！请检查权重前缀。示例缺失: {missing_vision[:2]}")
+        else:
+            rank0_print(f"✅ 视觉双塔对齐成功！已成功加载 {len(vision_dict)} 个核心参数。")
 
+    # ================= [终极修复：双路 Projector 并行加载] =================
     if model_args.pretrain_mm_mlp_adapter and os.path.exists(model_args.pretrain_mm_mlp_adapter):
-        rank0_print(f"🔗 正在物理加载 3.1 阶段预训练 Projector: {model_args.pretrain_mm_mlp_adapter}")
+        rank0_print(f"🔗 正在加载双路并行 Projector: {model_args.pretrain_mm_mlp_adapter}")
         projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location="cpu")
         
-        # [核心修复]：动态清理多余的嵌套前缀！
         cleaned_projector_dict = {}
         for k, v in projector_weights.items():
-            if "mm_projector" in k:
-                new_k = k[k.find("mm_projector"):] # 只保留 mm_projector 及以后的名字
+            # 寻找 mm_projector 或 mm_projector2 的起始位置，保留其完整后缀
+            if "mm_projector2" in k:
+                new_k = k[k.find("mm_projector2"):]
+                cleaned_projector_dict[new_k] = v
+            elif "mm_projector" in k:
+                new_k = k[k.find("mm_projector"):]
                 cleaned_projector_dict[new_k] = v
                 
         if len(cleaned_projector_dict) > 0:
-            model.get_model().load_state_dict(cleaned_projector_dict, strict=False)
-            rank0_print(f"✅ 成功加载 {len(cleaned_projector_dict)} 个 Projector 参数！模型成功睁开双眼！")
+            # 这里的加载建议也用 strict=False 兼容 Embedding 等参数
+            res = model.get_model().load_state_dict(cleaned_projector_dict, strict=False)
+            rank0_print(f"✅ Projector 加载完毕！匹配项: {len(cleaned_projector_dict)}。结果: {res}")
         else:
-            rank0_print("❌ [致命错误] 找到了文件，但里面没有 mm_projector 参数！")
+            rank0_print("❌ [错误] 权重文件中未探测到任何 Projector 参数！")
 
     model.requires_grad_(False)
     for p in model.get_model().mm_projector.parameters(): p.requires_grad = True
