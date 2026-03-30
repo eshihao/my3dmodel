@@ -1228,7 +1228,11 @@ def main():
             rank0_print("❌ [错误] 权重文件中未探测到任何 Projector 参数！")
 
     model.requires_grad_(False)
-    for p in model.get_model().mm_projector.parameters(): p.requires_grad = True
+    for p in model.get_model().mm_projector.parameters():
+        p.requires_grad = True
+    if hasattr(model.get_model(), "mm_projector2"):
+        for p in model.get_model().mm_projector2.parameters():
+            p.requires_grad = True
 
     if training_args.lora_enable:
         lora_config = LoraConfig(
@@ -1238,7 +1242,8 @@ def main():
         )
         model = get_peft_model(model, lora_config)
         for n, p in model.named_parameters():
-            if 'mm_projector' in n: p.requires_grad = True
+            if 'mm_projector' in n:
+                p.requires_grad = True
 
     # model.print_trainable_parameters()
 
