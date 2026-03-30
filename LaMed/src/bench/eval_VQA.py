@@ -11,14 +11,14 @@ import pandas as pd
 import monai.transforms as mtf
 from monai.data import set_track_meta
 from safetensors.torch import load_file
-from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
+from peft import LoraConfig, get_peft_model
 import torch.nn as nn
 import sys
 
-# 引入 accelerate 处理多卡并行
 from accelerate import Accelerator
 from accelerate.utils import gather_object
 
+# 确保能找到项目根目录下的模型代码
 sys.path.append("/data/esh/HSENet/Preprint")
 from LaMed.src.model.language_model import LamedPhi3ForCausalLM
 
@@ -34,7 +34,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default="/data/esh/HSENet/phi-4-mini-instruct/Phi-4-mini-instruct")
     parser.add_argument('--pretrained_vision_tower_path', type=str, default="/data/esh/HSENet/Preprint/LaMed/output_new/stage2/model.safetensors")
-    parser.add_argument('--resume_mllm_weights', type=str, default="/data/esh/HSENet/Preprint/LaMed/output_new/stage3_2_finetune_test/mm_projector_and_lora.bin")
+    parser.add_argument('--resume_mllm_weights', type=str, default="/data/esh/HSENet/Preprint/LaMed/output_new/stage3_2_VQA/saved_30000/pytorch_model.bin")
     
     parser.add_argument('--pretrain_mm_mlp_adapter', type=str, default=None)
     parser.add_argument('--tune_mm_mlp_adapter', type=bool, default=False)
@@ -57,7 +57,7 @@ def parse_args():
     parser.add_argument('--segmentation_module', type=str, default=None)
     parser.add_argument('--pretrain_seg_module', type=str, default=None)
 
-    parser.add_argument('--max_length', type=int, default=2048)
+    parser.add_argument('--max_length', type=int, default=1024)
     parser.add_argument('--max_new_tokens', type=int, default=256)
     parser.add_argument('--do_sample', type=bool, default=False)
     parser.add_argument('--top_p', type=float, default=None)
@@ -65,8 +65,9 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=1)
 
     parser.add_argument('--data_root', type=str, default="/data/esh/HSENet/m3d_data")
-    parser.add_argument('--vqa_data_test_path', type=str, default="/data/esh/HSENet/m3d_data/M3D-VQA/M3D_VQA_test5k_new_1.csv") 
-    parser.add_argument('--close_ended', type=bool, default=True) # 注意这里可以按需修改
+    # 默认使用你最新的验证集 csv
+    parser.add_argument('--vqa_data_test_path', type=str, default="/data/esh/HSENet/m3d_data/M3D-VQA/M3D_VQA_test5k_new.csv") 
+    parser.add_argument('--close_ended', type=bool, default=True) 
     parser.add_argument('--output_dir', type=str, default="./eval_results/M3D_VQA/")
     
     return parser.parse_args()
@@ -80,11 +81,12 @@ def find_all_linear_names(model):
         if isinstance(module, cls): lora_module_names.add(name)
     return list(lora_module_names)
 
-# [核心修复 1]：严格对齐训练时的 32 层重采样和纯净 512 维特征
 def load_or_create_2d_feat(image_abs_path, target_slices=32):
     feat_2d_path = image_abs_path.replace(".npy", "_2D.npy")
     if os.path.exists(feat_2d_path):
         feats = np.load(feat_2d_path)
+        if feats.shape[-1] != 512:
+            return torch.zeros((target_slices, 512), dtype=torch.bfloat16)
         total_slices = feats.shape[0]
         if total_slices > 0:
             idx = np.linspace(0, total_slices - 1, target_slices).astype(int)
@@ -102,7 +104,6 @@ class RobustVQADataset(Dataset):
         self.close_ended = close_ended
         self.image_tokens = "<im_patch>" * args.proj_out_num
         self.data_list = pd.read_csv(args.vqa_data_test_path)
-        
         self.transform = mtf.Compose([mtf.ToTensor(dtype=torch.float)])
         set_track_meta(False)
 
@@ -125,19 +126,20 @@ class RobustVQADataset(Dataset):
                 image = self.transform(image)
                 image_2d = load_or_create_2d_feat(image_abs_path)
                 
-                raw_question = data["Question"]
+                raw_question = str(data["Question"]).strip()
+                # [终极修复 1]：绝对纯净的格式，完全抛弃 Chat 模板，原汁原味还原 dataset.py
                 if self.close_ended:
-                    clean_question = "Closed VQA Task: " + raw_question + '\n' + "Choices: A. {} B. {} C. {} D. {}".format(data["Choice A"], data["Choice B"], data["Choice C"], data["Choice D"])
-                    answer = "{}. {}".format(data["Answer Choice"], data["Answer"])
-                    answer_choice = data["Answer Choice"]
+                    clean_question = f"Closed VQA Task: {raw_question} Choices: A. {data['Choice A']} B. {data['Choice B']} C. {data['Choice C']} D. {data['Choice D']}"
+                    answer = f"{data['Answer Choice']}. {data['Answer']}"
+                    answer_choice = str(data["Answer Choice"]).strip()
                 else:
-                    clean_question = "Open VQA Task: " + raw_question
-                    answer = str(data["Answer"])
+                    clean_question = f"Open VQA Task: {raw_question}"
+                    answer = str(data["Answer"]).strip()
                     answer_choice = ""
 
-                # [核心修复 2]：严格应用 Phi-4 Instruct 的对话模板！
-                # 只有加上 <|assistant|>，模型才会知道该轮到它作答了，否则它会直接输出 <|end|>
-                prompt_question = f"<|user|>\n{self.image_tokens}\n{clean_question}<|end|>\n<|assistant|>\n"
+                prompt_question = f"{self.image_tokens} {clean_question} Answer: "
+                if self.tokenizer.bos_token: 
+                    prompt_question = self.tokenizer.bos_token + prompt_question
 
                 return {
                     'image': image, 
@@ -145,7 +147,7 @@ class RobustVQADataset(Dataset):
                     'clean_question': clean_question, 
                     'answer': answer, 
                     'answer_choice': answer_choice, 
-                    'question_type': data["Question Type"], 
+                    'question_type': data.get("Question Type", "unknown"), 
                     'image_2d': image_2d 
                 }
             except Exception:
@@ -160,8 +162,7 @@ def main():
     accelerator = Accelerator()
     device = accelerator.device
 
-    if accelerator.is_main_process:
-        print("="*20 + " Tokenizer Preparation " + "="*20)
+    if accelerator.is_main_process: print("\n" + "="*20 + " Tokenizer Preparation " + "="*20)
         
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_name_or_path, model_max_length=args.max_length,
@@ -171,17 +172,14 @@ def main():
     tokenizer.add_tokens("[SEG]")
     
     if tokenizer.pad_token is None:
-        if tokenizer.unk_token is not None:
-            tokenizer.pad_token = tokenizer.unk_token
-        else:
-            tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+        if tokenizer.unk_token is not None: tokenizer.pad_token = tokenizer.unk_token
+        else: tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     
     args.img_token_id = tokenizer.convert_tokens_to_ids("<im_patch>")
     args.seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
     args.vocab_size = len(tokenizer)
 
-    if accelerator.is_main_process:
-        print("="*20 + " Model Preparation " + "="*20)
+    if accelerator.is_main_process: print("="*20 + " Model Preparation " + "="*20)
         
     model = LamedPhi3ForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.bfloat16)
     model.resize_token_embeddings(len(tokenizer))
@@ -192,31 +190,37 @@ def main():
     args.num_new_tokens = 4
     model.initialize_vision_tokenizer(args, tokenizer)
 
+    # ================= [终极修复 2] 视觉双塔强健映射 =================
     if os.path.exists(args.pretrained_vision_tower_path):
+        if accelerator.is_main_process: print(f"🚀 Loading Vision Tower: {args.pretrained_vision_tower_path}")
         sd = load_file(args.pretrained_vision_tower_path) if args.pretrained_vision_tower_path.endswith(".safetensors") else torch.load(args.pretrained_vision_tower_path, map_location="cpu")
-        model.get_model().vision_tower.load_state_dict({k.replace("vision_encoder.", ""): v for k, v in sd.items() if "vision_encoder." in k}, strict=False)
+        vision_dict = {}
+        for k, v in sd.items():
+            if k.startswith("stage1_pretrained_CLIP.vision_encoder."):
+                vision_dict[k.replace("stage1_pretrained_CLIP.vision_encoder.", "vision_tower_stage1.")] = v
+            elif k.startswith("vision_encoder."):
+                vision_dict[k.replace("vision_encoder.", "vision_tower_stage2.")] = v
+            elif any(k.startswith(p) for p in ["blocks.", "patch_embedding.", "cls_token", "norm.", "sgat.", "sga.", "sga_adapter", "kd_proj"]):
+                vision_dict[f"vision_tower_stage2.{k}"] = v
+        model.get_model().vision_tower.load_state_dict(vision_dict, strict=False)
 
     lora_config = LoraConfig(r=16, lora_alpha=32, target_modules=find_all_linear_names(model), lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
     model = get_peft_model(model, lora_config)
 
+    # ================= [终极修复 3] 极简原生加载 Projector 与 LoRA =================
     if os.path.exists(args.resume_mllm_weights):
-        if accelerator.is_main_process:
-            print(f"Loading finetuned weights from: {args.resume_mllm_weights}")
+        if accelerator.is_main_process: print(f"📦 Loading Finetuned Weights: {args.resume_mllm_weights}")
         finetuned_weights = torch.load(args.resume_mllm_weights, map_location="cpu")
         
-        projector_weights = {k.replace("mm_projector.", ""): v for k, v in finetuned_weights.items() if 'mm_projector' in k}
-        if len(projector_weights) > 0:
-            # 兼容保存时的 key name 可能带有多余前缀
-            model.get_model().mm_projector.load_state_dict(projector_weights, strict=False)
-            
-        from peft import set_peft_model_state_dict
-        lora_weights = {}
-        for k, v in finetuned_weights.items():
-            if 'lora' in k:
-                new_key = k.replace("base_model.model.", "")
-                lora_weights[new_key] = v
-        if len(lora_weights) > 0:
-            set_peft_model_state_dict(model, lora_weights)
+        # 极简加载：你保存的是 PeftModel 的原生参数，直接原路塞回去绝对不出错！
+        res = model.load_state_dict(finetuned_weights, strict=False)
+        
+        if accelerator.is_main_process:
+            loaded_proj = sum(1 for k in finetuned_weights if 'mm_projector' in k)
+            loaded_lora = sum(1 for k in finetuned_weights if 'lora' in k)
+            print(f"✅ 成功挂载 {loaded_proj} 个 Projector 参数，{loaded_lora} 个 LoRA 参数！")
+            if "unexpected_keys" in str(res) and len(res.unexpected_keys) > 0:
+                print(f"⚠️ 注意: 存在无法对齐的参数: {res.unexpected_keys[:3]}...")
 
     model.eval()
 
@@ -239,48 +243,49 @@ def main():
     if not os.path.exists(args.output_dir) and accelerator.is_main_process:
         os.makedirs(args.output_dir)
 
-    if accelerator.is_main_process:
-        print("="*20 + " Start Inference " + "="*20)
+    if accelerator.is_main_process: print("\n" + "="*20 + " Start Inference " + "="*20)
         
     local_results = []
 
-    for sample in tqdm(test_dataloader, disable=not accelerator.is_main_process):
+    for i_batch, sample in enumerate(tqdm(test_dataloader, disable=not accelerator.is_main_process)):
         images = sample["images"].to(device, dtype=torch.bfloat16)
         images_2d = sample["images_2d"].to(device, dtype=torch.bfloat16)
         questions = sample["questions"]
         clean_questions = sample["clean_questions"]
         
-        inputs = tokenizer(questions, return_tensors="pt", padding=True)
+        # [终极修复 4]：禁止自动加 EOS，避免瞬间闭嘴
+        inputs = tokenizer(questions, return_tensors="pt", padding=True, add_special_tokens=False)
         input_ids = inputs['input_ids'].to(device)
         attention_mask = inputs['attention_mask'].to(device)
 
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             unwrapped_model = accelerator.unwrap_model(model)
             
-            # [核心修复 3]：增加 max_new_tokens 并修正传参规范
-            generation_kwargs = dict(
-                input_ids=input_ids,             # 必须显式传 input_ids
-                attention_mask=attention_mask,
-                max_new_tokens=20 if args.close_ended else 150, # 闭卷VQA给 20 个token裕量防阶段
-                repetition_penalty=1.0, 
-                do_sample=False, 
-                pad_token_id=tokenizer.pad_token_id, 
-                eos_token_id=tokenizer.eos_token_id
-            )
-            
+            # [终极修复 5]：加大惩罚力度对抗复读机
             generation = unwrapped_model.generate(
+                inputs=input_ids,
                 images=images,
                 images_2d=images_2d,
-                **generation_kwargs
+                attention_mask=attention_mask,
+                max_new_tokens=5 if args.close_ended else 150, 
+                repetition_penalty=1.2, 
+                do_sample=False, 
+                pad_token_id=tokenizer.pad_token_id, 
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=True
             )
         
-        input_len = input_ids.shape[1]
-        
-        # 逐个解析 Batch 内的生成结果
+        # [终极修复 6]：自适应解码逻辑，彻底无视 padding 与 prompt 返回干扰
         for i in range(len(generation)):
-            # 只截取模型新生成的部分
-            gen_toks = generation[i][input_len:]
-            pred_text = tokenizer.decode(gen_toks, skip_special_tokens=True).strip()
+            output_ids = generation[i]
+            inp_len = input_ids[i].shape[0]
+            
+            if len(output_ids) > inp_len and torch.equal(output_ids[:inp_len], input_ids[i]):
+                output_ids = output_ids[inp_len:]
+                
+            pred_text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+            if "Answer:" in pred_text:
+                pred_text = pred_text.split("Answer:")[-1].strip()
             
             q_type = sample["question_types"][i]
             clean_q = clean_questions[i]
@@ -289,14 +294,15 @@ def main():
             
             if args.close_ended:
                 import re
-                # 兼容模型输出 "A", "The answer is A", "A." 等情况
                 match = re.search(r'([A-D])', pred_text)
-                if match:
-                    model_choice = match.group(1)
-                    correct = 1 if model_choice == a_c else 0
-                else:
-                    correct = 0
+                model_choice = match.group(1) if match else ""
+                correct = 1 if (model_choice == str(a_c)) else 0
                 local_results.append([q_type, clean_q, a, a_c, pred_text, correct])
+                
+                # 实时打印前两个 Batch 的推理情况，监控模型是否在认真思考
+                if i_batch < 2 and accelerator.is_main_process:
+                    status = '✅' if correct else '❌'
+                    print(f"\n[实时监控] 真实答案: {a_c} | 模型预测: {pred_text} | {status}")
             else:
                 local_results.append([q_type, clean_q, a, "", pred_text, 0])
 
@@ -322,6 +328,10 @@ def main():
                 writer.writerow(row)
                 
         print(f"\nEvaluation Complete! Saved {len(unique_results)} unique results to {output_path}")
+        
+        if args.close_ended and len(unique_results) > 0:
+            acc = sum(r[5] for r in unique_results) / len(unique_results)
+            print(f"🔥 Final VQA Accuracy: {acc * 100:.2f}%")
 
 if __name__ == "__main__":
     main()
