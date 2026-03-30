@@ -1,65 +1,79 @@
-# VQA Eval 准确率诊断（基于当前代码与日志）
+# VQA 诊断（针对：为何 stage3_2 在 70000 steps 最好也只有 ~49%）
 
-## 1) 你当前的真实模型架构（按代码还原）
-
-1. **LLM 主干**：`LamedPhi3ForCausalLM`（Phi-3 Causal LM）。
-2. **视觉塔**：`vit_stage2_dual_encoders`（`ViT3DTower_dual_encoders`），内部同时有：
-   - `vision_tower_stage1 = ViT_stage1`
-   - `vision_tower_stage2 = ViT_stage2`
-3. **2D 特征融合路径**：`vision_tower_stage2(images, slice_features=images_2d)`，说明 2D slice 特征直接进入 stage2 编码分支。
-4. **多模态映射**：视觉特征经 `mm_projector`（类型 `VisualPacker_3d_phi_v3`）映射到 LLM hidden 后，插入到文本 embedding。
-5. **stage3 可训练参数范围**：在 `train.py` 的有效代码中，`model.requires_grad_(False)` 后只显式打开 `mm_projector` 与 LoRA 参数，视觉塔默认冻结。
+> 结论先行：不是单一原因，而是 **架构实现与训练目标存在错位**，叠加 **多任务稀释 + 严格判分口径 + 部分2D特征缺失**。70000 steps 更像是中期平衡点，而不是最终收敛点。
 
 ---
 
-## 2) 日志告诉我们的关键事实
+## 1) 你当前“实际生效”的模型架构（按代码路径还原）
 
-### A. stage2 很高的 accuracy 不是 VQA accuracy
+1. 语言主干：`LamedPhi3ForCausalLM`（Phi-3 Causal LM）。
+2. 视觉塔：`vit_stage2_dual_encoders` -> `ViT3DTower_dual_encoders`（stage1 + stage2 双路）。
+3. projector：`VisualPacker_3d_phi_v3`，输入期望是 3D patch token 序列（后续 reshape 到 `(8,16,16,768)` 结构）。
+4. 训练可学习参数（stage3）：`model.requires_grad_(False)` 后仅打开 `mm_projector` + LoRA。
 
-- `train_stage2.log` 里 `eval_accuracy=0.957...`，但这是 stage2 的图文对齐训练指标，不是 close-ended VQA 选项准确率。
+### 关键实现错位（非常重要）
 
-### B. stage3_1 更像“对齐过渡阶段”，不是 VQA 收敛阶段
+- `ViT3DTower_dual_encoders.forward` 返回的是双分支 `(image_features_stage1, image_features_stage2)`。
+- 但 `lamed_phi3.py` 中 `encode_images()` 遇到 tuple 时只取 `vision_out[0]`，即只用第一分支特征；第二分支基本被丢弃。
+- 同时代码把 token 数强制插值到 `EXPECTED_N=2048` 再送入 `mm_projector`。
 
-- `train_3-1.sh` 中：`evaluation_strategy="no"`，无在线验证。
-- `train_stage3_1.log` 末段 loss 仍约 2.3~2.4，说明远未达到高质量 VQA 收敛态。
-
-### C. stage3_2 存在混合任务冲突与输入质量波动
-
-- 训练集是 `CapDataset + Close VQA + Open VQA` 直接 concat 混训，close-ended 目标被稀释。
-- `train_stage3_2.log` 出现多次“找不到 2D 特征文件，使用零矩阵兜底”警告，代表部分样本视觉条件被弱化。
-
-### D. 你的评估脚本对 close-ended 判分偏“苛刻”
-
-- 推理时 `max_new_tokens=5`。
-- 判分逻辑是从生成文本里用正则直接抓 `[A-D]`，格式稍偏就会被记错（如先输出解释、先出现无关字母）。
+这意味着：
+- 你名义上是“dual encoders + 2D增强”，但实际训练/推理可能主要靠第一路；
+- 双路设计收益无法充分兑现；
+- 也能解释为什么中期能到49%，但上不去。
 
 ---
 
-## 3) 为什么“stage3_2 约 70000 steps 最好，也才 49%”
+## 2) 三份日志和训练脚本给出的事实
 
-这在你当前 pipeline 下是**典型中期峰值**：
+### stage2
+- `train_stage2.log` 的 `eval_accuracy=0.957` 是 stage2 对齐任务指标，不是 close-ended VQA 选项准确率。
 
-1. **前期欠拟合**：LoRA + projector 刚开始适配，VQA 还没学稳。
-2. **中期（~70k）平衡点**：视觉对齐、语言格式、VQA 任务三者短暂达到较佳平衡。
-3. **后期退化**：混合任务训练继续推进后，模型更偏向“通用生成/caption/open VQA”分布，close-ended 分类能力被冲淡；再叠加严格判分规则，离线评估准确率继续下降。
+### stage3_1
+- `train_3-1.sh` 设置了 `evaluation_strategy="no"`，没有在线验证 VQA 指标。
+- `train_stage3_1.log` 末段 loss 仍约 2.3~2.4，说明更像过渡对齐阶段。
 
-因此：
-- 70000 step 出现峰值并不奇怪；
-- 49% 停在较低水平，也符合“任务目标与训练目标不完全一致 + 判分口径偏严格 + 部分样本2D特征缺失”的组合效应。
-
----
-
-## 4) 直接可执行的改进建议（按优先级）
-
-1. **把 close-ended VQA 权重提上去**：不要与 caption/open-vqa 等权（建议 2~4 倍采样权重）。
-2. **增加 close-ended 专项收尾**：混训后再做一段 close-ended-only SFT（例如 5k~20k steps）。
-3. **修复 2D 特征缺失链路**：优先补齐 `_2D.npy`，避免零向量兜底频繁发生。
-4. **放宽 eval 判分鲁棒性**：先做答案归一化（`A.`/`Option A`/`答案是A` 等），再提取选项字母。
-5. **把 checkpoint 网格加密到峰值区间**：围绕 40k~100k 每 2k 保存+评估，精确定位最优点。
+### stage3_2
+- `UniDatasets` 是 `Caption + Close VQA + Open VQA` 直接 concat，任务目标天然冲突（尤其对 close-ended 分类）。
+- `train_stage3_2.log` 明确出现多次“2D特征缺失 -> 零向量兜底”警告，样本质量在训练中有波动。
+- 末段学习率已经很低（接近衰减尾部），继续训练容易把模型推向“通用生成分布”，对 close-ended 可能反而变差。
 
 ---
 
-## 5) 一句话结论
+## 3) 为什么 70000 steps 最优（但只有49%）
 
-你的 49% 上限与“只有 stage3_2 的 70000 steps 最好”并非单点 bug，而是：
-**stage2 指标与目标不一致 + stage3 混合任务冲突 + stage3 中后期分布漂移 + 部分2D特征缺失 + close-ended判分口径偏严格** 共同导致。
+这个现象与当前代码逻辑高度一致：
+
+1. **前期（<70k）**：projector + LoRA 仍在快速适配，欠拟合明显。
+2. **中期（~70k）**：视觉-语言对齐、生成格式、VQA决策暂时达到平衡，出现局部峰值。
+3. **后期（>70k）**：
+   - 多任务训练继续拉扯 close-ended 目标；
+   - 部分2D缺失样本持续注入噪声；
+   - 评估脚本 `max_new_tokens=5` + `[A-D]` 正则抓取过严，格式偏差被计错。
+
+因此：70000 是“局部最优检查点”，49% 是当前 pipeline 的“结构性上限”表现，而不是偶然值。
+
+---
+
+## 4) 可落地的解决方案（按优先级）
+
+### P0（必须先做）
+1. **修正双路视觉融合**：在 `encode_images()` 中不要只取 tuple 第一路，至少恢复双路合并逻辑（如 stage1/stage2 分路 projector 后 concat 或门控融合）。
+2. **保证 `mm_projector2` 策略一致**：若启用 dual 分支，就显式训练/加载 `mm_projector2`；否则统一改为单路配置，避免“名义双路、实际单路”。
+3. **修复2D特征缺失**：补齐 `_2D.npy`，把零向量兜底比例降到接近0。
+
+### P1（显著提分）
+4. **close-ended 专项训练收尾**：混训后追加 close-ended-only SFT（例如 5k~20k steps）。
+5. **训练采样重加权**：提高 close-ended VQA 采样权重（建议 2~4x），降低 caption/open 比例。
+6. **checkpoint 密集评测**：40k~100k 每 2k 离线评估一次，精确找峰值而不是只看大步长。
+
+### P2（评测口径修正）
+7. **答案归一化后再判分**：支持 `A.`、`Option A`、`答案是A` 等格式，减少假阴性。
+8. **close-ended 推理放宽 token 上限**：`max_new_tokens` 可从 5 提到 8~12，降低截断造成的格式错误。
+
+---
+
+## 5) 一句话总结
+
+你现在遇到的“stage3_2 70000 steps 最高且仅49%”主要由：
+**双路视觉在实现上未充分生效 + 多任务冲突 + 2D特征缺失 + 严格判分口径** 共同导致；先修 P0，再做 P1/P2，通常会比盲目延长训练步数更有效。
