@@ -302,7 +302,10 @@ class LamedPhi3ForCausalLM(LamedMetaForCausalLM, Phi3ForCausalLM):
                     vision_out = vision_tower(images)
             
             # Extract Feature Tensor
+            # dual encoders: keep two branches to avoid silently dropping one path.
             image_features = None
+            image_features_sec = None
+
             if isinstance(vision_out, torch.Tensor):
                 image_features = vision_out
             elif isinstance(vision_out, dict):
@@ -310,28 +313,43 @@ class LamedPhi3ForCausalLM(LamedMetaForCausalLM, Phi3ForCausalLM):
                     if key in vision_out:
                         image_features = vision_out[key]
                         break
-                if image_features is None: image_features = list(vision_out.values())[0]
+                if image_features is None:
+                    image_features = list(vision_out.values())[0]
             elif isinstance(vision_out, (tuple, list)):
                 image_features = vision_out[0]
-            
-            # Interpolate if needed
-            if image_features is not None:
-                B, N, C = image_features.shape
-                EXPECTED_N = 2048 
-                if N != EXPECTED_N:
-                    image_features = image_features.transpose(1, 2)
-                    image_features = F.interpolate(image_features, size=EXPECTED_N, mode='linear', align_corners=False)
-                    image_features = image_features.transpose(1, 2)
-            else:
-                 B = images.shape[0]
-                 image_features = torch.zeros((B, 2048, 768), device=images.device, dtype=dtype)
+                if len(vision_out) > 1:
+                    image_features_sec = vision_out[1]
+
+            def _align_patch_num(feat, expected_n=2048):
+                if feat is None:
+                    return None
+                _, n, _ = feat.shape
+                if n != expected_n:
+                    feat = feat.transpose(1, 2)
+                    feat = F.interpolate(feat, size=expected_n, mode='linear', align_corners=False)
+                    feat = feat.transpose(1, 2)
+                return feat
+
+            image_features = _align_patch_num(image_features, expected_n=2048)
+            image_features_sec = _align_patch_num(image_features_sec, expected_n=2048)
+
+            if image_features is None:
+                b = images.shape[0]
+                image_features = torch.zeros((b, 2048, 768), device=images.device, dtype=dtype)
 
         # 3. Projector (Requires Grad!)
-        # 注意：Projector 必须在 no_grad 之外，因为它需要训练！
-        # 还要确保 features 是 requires_grad=True 的 (虽然来自 no_grad 块，但在 Projector 里会有新梯度)
-        # 这里是个 trick: 虽然 image_features 没梯度，但 Projector 权重有梯度，所以能训练。
-        image_features = image_features.to(dtype) # 再次确保精度匹配
+        image_features = image_features.to(dtype)
         image_features = self.get_model().mm_projector(image_features)
+
+        # If dual branch exists, project it with mm_projector2 (or fallback projector),
+        # then fuse with averaging to keep token length unchanged.
+        if image_features_sec is not None:
+            image_features_sec = image_features_sec.to(dtype)
+            if hasattr(self.get_model(), "mm_projector2"):
+                image_features_sec = self.get_model().mm_projector2(image_features_sec)
+            else:
+                image_features_sec = self.get_model().mm_projector(image_features_sec)
+            image_features = 0.5 * (image_features + image_features_sec)
         
         return image_features
 
