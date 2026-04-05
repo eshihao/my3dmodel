@@ -1281,6 +1281,7 @@ class VQADataset(Dataset):
         self.tokenizer = tokenizer
         self.mode = mode
         self.close_ended = close_ended
+        self.vqa_answer_mode = getattr(args, "vqa_answer_mode", "full")
         self.image_tokens = "<im_patch>" * args.proj_out_num
         
         if mode == "train": path = args.vqa_data_train_path
@@ -1323,7 +1324,10 @@ class VQADataset(Dataset):
                 question = "Closed VQA Task: " + question
                 choices = "Choices: A. {} B. {} C. {} D. {}".format(data["Choice A"], data["Choice B"], data["Choice C"], data["Choice D"])
                 question = question + ' ' + choices
-                answer = "{}. {}".format(data["Answer Choice"], data["Answer"])
+                if str(self.vqa_answer_mode).lower() == "choice_only":
+                    answer = str(data["Answer Choice"]).strip()
+                else:
+                    answer = "{}. {}".format(data["Answer Choice"], data["Answer"])
             else:
                 question = "Open VQA Task: " + question
                 answer = str(data["Answer"])

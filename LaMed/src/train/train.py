@@ -952,7 +952,7 @@ from transformers import TrainerCallback
 sys.path.append("/data/esh/HSENet/Preprint")
 from LaMed.src.model.language_model import LamedPhi3ForCausalLM 
 from LaMed.src.train.lamed_trainer import LaMedTrainer
-from LaMed.src.dataset.dataset import UniDatasets, CapDataset
+from LaMed.src.dataset.dataset import UniDatasets, CapDataset, VQADataset
 
 local_rank = None
 
@@ -997,6 +997,8 @@ class DataArguments:
     proj_out_num: int = 144 
     seg_enable: bool = False
     max_length: int = 1024
+    dataset_mix_mode: str = field(default="mix")
+    vqa_answer_mode: str = field(default="full")
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -1228,7 +1230,11 @@ def main():
             rank0_print("❌ [错误] 权重文件中未探测到任何 Projector 参数！")
 
     model.requires_grad_(False)
-    for p in model.get_model().mm_projector.parameters(): p.requires_grad = True
+    for p in model.get_model().mm_projector.parameters():
+        p.requires_grad = True
+    if hasattr(model.get_model(), "mm_projector2"):
+        for p in model.get_model().mm_projector2.parameters():
+            p.requires_grad = True
 
     if training_args.lora_enable:
         lora_config = LoraConfig(
@@ -1238,7 +1244,8 @@ def main():
         )
         model = get_peft_model(model, lora_config)
         for n, p in model.named_parameters():
-            if 'mm_projector' in n: p.requires_grad = True
+            if 'mm_projector' in n:
+                p.requires_grad = True
 
     # model.print_trainable_parameters()
 
@@ -1256,7 +1263,22 @@ def main():
     data_args.max_length = training_args.model_max_length
     data_args.proj_out_num = model.get_model().mm_projector.proj_out_num
 
-    train_dataset = UniDatasets(data_args, tokenizer, mode='train')
+    dataset_mode = str(getattr(data_args, "dataset_mix_mode", "mix")).lower()
+    if dataset_mode == "mix":
+        train_dataset = UniDatasets(data_args, tokenizer, mode='train')
+    elif dataset_mode == "cap_only":
+        train_dataset = CapDataset(data_args, tokenizer, mode='train')
+    elif dataset_mode == "vqa_only":
+        train_dataset = VQADataset(data_args, tokenizer, close_ended=True, mode='train')
+    elif dataset_mode == "close_open_vqa":
+        from torch.utils.data import ConcatDataset
+        train_dataset = ConcatDataset([
+            VQADataset(data_args, tokenizer, close_ended=True, mode='train'),
+            VQADataset(data_args, tokenizer, close_ended=False, mode='train'),
+        ])
+    else:
+        raise ValueError(f"Unknown dataset_mix_mode: {dataset_mode}. "
+                         f"Choose from [mix, cap_only, vqa_only, close_open_vqa].")
     eval_dataset = CapDataset(data_args, tokenizer, mode='validation')
     data_collator = DataCollator(data_args.seg_enable, tokenizer.pad_token_id, training_args.model_max_length)
 

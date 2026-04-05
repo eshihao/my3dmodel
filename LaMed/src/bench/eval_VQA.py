@@ -31,20 +31,30 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
 
 def parse_args():
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        v = str(v).strip().lower()
+        if v in {"true", "1", "yes", "y", "t"}:
+            return True
+        if v in {"false", "0", "no", "n", "f"}:
+            return False
+        raise argparse.ArgumentTypeError(f"Invalid bool value: {v}")
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name_or_path', type=str, default="/data/esh/HSENet/phi-4-mini-instruct/Phi-4-mini-instruct")
     parser.add_argument('--pretrained_vision_tower_path', type=str, default="/data/esh/HSENet/Preprint/LaMed/output_new/stage2/model.safetensors")
     parser.add_argument('--resume_mllm_weights', type=str, default="/data/esh/HSENet/Preprint/LaMed/output_new/stage3_2_VQA/saved_30000/pytorch_model.bin")
     
     parser.add_argument('--pretrain_mm_mlp_adapter', type=str, default=None)
-    parser.add_argument('--tune_mm_mlp_adapter', type=bool, default=False)
+    parser.add_argument('--tune_mm_mlp_adapter', type=str2bool, default=False)
     parser.add_argument('--version', type=str, default="v0")
     parser.add_argument('--vision_tower', type=str, default="vit_stage2_dual_encoders")
     parser.add_argument('--mm_projector_type', type=str, default="VisualPacker_3d_phi_v3")
     parser.add_argument('--proj_out_num', type=int, default=144)
     parser.add_argument('--vision_select_layer', type=int, default=-1)
     parser.add_argument('--vision_select_feature', type=str, default="patch")
-    parser.add_argument('--use_parallel_projector', type=bool, default=True)
+    parser.add_argument('--use_parallel_projector', type=str2bool, default=True)
     parser.add_argument('--remain_2d3d_ViT_type', type=str, default="dual_vits")
     parser.add_argument('--image_channel', type=int, default=1)
     parser.add_argument('--image_size', nargs='+', type=int, default=[32, 256, 256])
@@ -53,13 +63,13 @@ def parse_args():
     parser.add_argument('--proj_layer_num', type=int, default=2)
     parser.add_argument('--proj_pooling_type', type=str, default="spatial")
     parser.add_argument('--proj_pooling_size', type=int, default=2)
-    parser.add_argument('--freeze_vision_tower', type=bool, default=True)
+    parser.add_argument('--freeze_vision_tower', type=str2bool, default=True)
     parser.add_argument('--segmentation_module', type=str, default=None)
     parser.add_argument('--pretrain_seg_module', type=str, default=None)
 
     parser.add_argument('--max_length', type=int, default=1024)
     parser.add_argument('--max_new_tokens', type=int, default=256)
-    parser.add_argument('--do_sample', type=bool, default=False)
+    parser.add_argument('--do_sample', type=str2bool, default=False)
     parser.add_argument('--top_p', type=float, default=None)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--batch_size', type=int, default=1)
@@ -67,7 +77,7 @@ def parse_args():
     parser.add_argument('--data_root', type=str, default="/data/esh/HSENet/m3d_data")
     # 默认使用你最新的验证集 csv
     parser.add_argument('--vqa_data_test_path', type=str, default="/data/esh/HSENet/m3d_data/M3D-VQA/M3D_VQA_test5k_new.csv") 
-    parser.add_argument('--close_ended', type=bool, default=True) 
+    parser.add_argument('--close_ended', type=str2bool, default=True)
     parser.add_argument('--output_dir', type=str, default="./eval_results/M3D_VQA/")
     
     return parser.parse_args()
@@ -148,7 +158,8 @@ class RobustVQADataset(Dataset):
                     'answer': answer, 
                     'answer_choice': answer_choice, 
                     'question_type': data.get("Question Type", "unknown"), 
-                    'image_2d': image_2d 
+                    'image_2d': image_2d,
+                    'image_path': data["Image Path"],
                 }
             except Exception:
                 idx = (idx + 1) % len(self.data_list)
@@ -232,7 +243,8 @@ def main():
             'answers': [b['answer'] for b in batch],
             'answer_choices': [b['answer_choice'] for b in batch],
             'question_types': [b['question_type'] for b in batch],
-            'images_2d': torch.stack([b['image_2d'] for b in batch])
+            'images_2d': torch.stack([b['image_2d'] for b in batch]),
+            'image_paths': [b['image_path'] for b in batch],
         }
 
     test_dataset = RobustVQADataset(args, tokenizer=tokenizer, close_ended=args.close_ended)
@@ -275,13 +287,19 @@ def main():
                 use_cache=True
             )
         
-        # [终极修复 6]：自适应解码逻辑，彻底无视 padding 与 prompt 返回干扰
+        # [终极修复 6]：自适应解码逻辑，兼容左填充与不同 generate 返回风格
         for i in range(len(generation)):
             output_ids = generation[i]
-            inp_len = input_ids[i].shape[0]
-            
-            if len(output_ids) > inp_len and torch.equal(output_ids[:inp_len], input_ids[i]):
-                output_ids = output_ids[inp_len:]
+            full_prompt_len = input_ids.shape[1]
+            valid_prompt_ids = input_ids[i][attention_mask[i].bool()]
+            valid_prompt_len = int(valid_prompt_ids.shape[0])
+
+            # 常见路径：generate 返回 [完整输入(含padding) + 新token]
+            if len(output_ids) > full_prompt_len and torch.equal(output_ids[:full_prompt_len], input_ids[i]):
+                output_ids = output_ids[full_prompt_len:]
+            # 兜底路径：若返回仅按有效 token 对齐，则按去 padding 后的 prompt 去切
+            elif len(output_ids) > valid_prompt_len and torch.equal(output_ids[:valid_prompt_len], valid_prompt_ids):
+                output_ids = output_ids[valid_prompt_len:]
                 
             pred_text = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
             if "Answer:" in pred_text:
@@ -291,20 +309,32 @@ def main():
             clean_q = clean_questions[i]
             a = sample["answers"][i]
             a_c = sample["answer_choices"][i]
+            img_p = sample["image_paths"][i]
             
             if args.close_ended:
                 import re
-                match = re.search(r'([A-D])', pred_text)
-                model_choice = match.group(1) if match else ""
-                correct = 1 if (model_choice == str(a_c)) else 0
-                local_results.append([q_type, clean_q, a, a_c, pred_text, correct])
+                pred_up = pred_text.strip().upper()
+                choice_patterns = [
+                    r'^\s*([A-D])\b',
+                    r'OPTION\s*([A-D])\b',
+                    r'ANSWER\s*(?:IS|:)?\s*([A-D])\b',
+                    r'\b([A-D])\b',
+                ]
+                model_choice = ""
+                for pat in choice_patterns:
+                    m = re.search(pat, pred_up)
+                    if m:
+                        model_choice = m.group(1)
+                        break
+                correct = 1 if (model_choice == str(a_c).strip().upper()) else 0
+                local_results.append([q_type, clean_q, a, a_c, pred_text, correct, img_p])
                 
                 # 实时打印前两个 Batch 的推理情况，监控模型是否在认真思考
                 if i_batch < 2 and accelerator.is_main_process:
                     status = '✅' if correct else '❌'
                     print(f"\n[实时监控] 真实答案: {a_c} | 模型预测: {pred_text} | {status}")
             else:
-                local_results.append([q_type, clean_q, a, "", pred_text, 0])
+                local_results.append([q_type, clean_q, a, "", pred_text, 0, img_p])
 
     accelerator.wait_for_everyone()
     gathered_results = gather_object(local_results)
@@ -316,14 +346,14 @@ def main():
         seen = set()
         unique_results = []
         for row in gathered_results:
-            row_str = str(row[1]) 
+            row_str = str((row[1], row[6]))
             if row_str not in seen:
                 seen.add(row_str)
                 unique_results.append(row)
 
         with open(output_path, mode='w', newline='', encoding='utf-8') as outfile:
             writer = csv.writer(outfile)
-            writer.writerow(["Question Type", "Question", "Answer", "Answer Choice", "Pred", "Correct"])
+            writer.writerow(["Question Type", "Question", "Answer", "Answer Choice", "Pred", "Correct", "Image Path"])
             for row in unique_results:
                 writer.writerow(row)
                 
